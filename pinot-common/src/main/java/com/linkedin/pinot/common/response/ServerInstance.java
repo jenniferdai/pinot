@@ -34,6 +34,8 @@ import org.slf4j.LoggerFactory;
  * local hostname.
  */
 public class ServerInstance implements Comparable<ServerInstance> {
+  // TODO jfim: Set this to false!
+  private static final boolean DISABLE_DNS_LOOKUPS = true;
 
   protected static final Logger LOGGER = LoggerFactory.getLogger(ServerInstance.class);
 
@@ -64,13 +66,15 @@ public class ServerInstance implements Comparable<ServerInstance> {
   }
 
   public ServerInstance(String name, int port, int seq) {
-    super();
     InetAddress ipAddr = null;
-    try {
-      ipAddr = InetAddress.getByName(name);
-    } catch (UnknownHostException e) {
-      LOGGER.error("Unable to fetch IpAddresses for host:" + name, e);
-      ipAddr = null;
+
+    if (!DISABLE_DNS_LOOKUPS) {
+      try {
+        ipAddr = InetAddress.getByName(name);
+      } catch (UnknownHostException e) {
+        LOGGER.error("Unable to fetch IpAddresses for host:" + name, e);
+        ipAddr = null;
+      }
     }
 
     _ipAddress = ipAddr;
