@@ -17,6 +17,7 @@
 package com.linkedin.pinot.routing.builder;
 
 import com.linkedin.pinot.common.response.ServerInstance;
+import com.linkedin.pinot.common.utils.CommonConstants;
 import com.linkedin.pinot.routing.ServerToSegmentSetMap;
 import com.linkedin.pinot.transport.common.SegmentIdSet;
 import java.io.File;
@@ -61,34 +62,34 @@ public class LargeClusterRoutingTableBuilder extends AbstractRoutingTableBuilder
       random = new Random();
 
       // Compute the inverse of the external view
-      for (String partition : externalView.getPartitionSet()) {
+      for (String segment : externalView.getPartitionSet()) {
         Set<String> instancesForSegment = new HashSet<>();
-        segmentToInstanceMap.put(partition, instancesForSegment);
+        segmentToInstanceMap.put(segment, instancesForSegment);
 
-        for (Map.Entry<String, String> instanceAndState : externalView.getStateMap(partition).entrySet()) {
+        for (Map.Entry<String, String> instanceAndState : externalView.getStateMap(segment).entrySet()) {
           String instance = instanceAndState.getKey();
           String state = instanceAndState.getValue();
 
           // Only consider partitions that are ONLINE
-          if (!"ONLINE".equals(state)) {
+          if (!CommonConstants.Helix.StateModel.SegmentOnlineOfflineStateModel.ONLINE.equals(state)) {
             continue;
           }
 
           // Add to the instance -> segments map
-          Set<String> partitionsForInstance = instanceToSegmentMap.get(instance);
+          Set<String> segmentsForInstance = instanceToSegmentMap.get(instance);
 
-          if (partitionsForInstance ==  null) {
-            partitionsForInstance = new HashSet<>();
-            instanceToSegmentMap.put(instance, partitionsForInstance);
+          if (segmentsForInstance ==  null) {
+            segmentsForInstance = new HashSet<>();
+            instanceToSegmentMap.put(instance, segmentsForInstance);
           }
 
-          partitionsForInstance.add(partition);
+          segmentsForInstance.add(segment);
 
           // Add to the segment -> instances map
           instancesForSegment.add(instance);
 
           // Add to the valid segments map
-          segmentsWithAtLeastOneOnlineReplica.add(partition);
+          segmentsWithAtLeastOneOnlineReplica.add(segment);
         }
       }
 
