@@ -48,135 +48,71 @@ import org.json.JSONObject;
 public class LargeClusterRoutingTableBuilder extends AbstractRoutingTableBuilder {
   int maxServersPerQuery = 20;
 
-  @Override
-  public void init(Configuration configuration) {
-    // Nothing to do
-    // FIXME jfim: Read the max number of replicas to hit
-  }
+  private class RoutingTableGenerator {
+    private Map<String, Set<String>> segmentToInstanceMap = new HashMap<>();
+    private Map<String, Set<String>> instanceToSegmentMap = new HashMap<>();
+    private Set<String> segmentsWithAtLeastOneOnlineReplica = new HashSet<>();
+    private Set<String> allInstanceSet;
+    private String[] instanceArray;
+    private Map<String, String[]> segmentToInstanceArrayMap;
+    private Random random;
 
-  @Override
-  public List<ServerToSegmentSetMap> computeRoutingTableFromExternalView(String tableName, ExternalView externalView,
-      List<InstanceConfig> instanceConfigList) {
-    // The default routing table algorithm tries to balance all available segments across all servers, so that each
-    // server is hit on every query. This works fine with small clusters (say less than 20 servers) but for larger
-    // clusters, this adds up to significant overhead (one request must be enqueued for each server, processed,
-    // returned, deserialized, aggregated, etc.).
-    //
-    // For large clusters, we want to avoid hitting every server, as this also has an adverse effect on client tail
-    // latency. This is due to the fact that a query cannot return until it has received a response from each server,
-    // and the greater the number of servers that are hit, the more likely it is that one of the servers will be a
-    // straggler (eg. due to contention for query processing threads, GC, etc.). We also want to balance the segments
-    // within any given routing table so that each server in the routing table has approximately the same number of
-    // segments to process.
-    //
-    // This routing table algorithm builds n routing tables, where n is the number of servers in the cluster (we might
-    // want to revisit that assumption for clusters larger than, say, 250 servers). Each routing table has one 'seed'
-    // server with which the routing table is initialized. To this seed server, we add maxServersPerQuery - 1 randomly
-    // picked servers. This guarantees that each server will to appear in at least one routing table and that overall
-    // the number of routing tables will ensure an approximately even distribution of load (which would not be the case
-    // with a fixed number of routing tables, eg. 10 routing tables for a 100 node cluster with 50 replicas).
-    //
-    // With this list of servers, we check if the set of segments served by these servers is complete. If the set of
-    // segments served does not cover all of the segments, we compute the list of missing segments and pick a random
-    // server that serves these missing segments until we have complete coverage of all the segments.
-    //
-    // We then order the segments in ascending number of replicas within our server set, in order to allocate the
-    // segments with fewer replicas first. This ensures that segments that are 'easier' to allocate are more likely to
-    // end up on a replica with fewer segments.
-    //
-    // Then, we pick a random replica for each segment, iterating from fewest replicas to most replicas, inversely
-    // weighted by the number of segments already assigned to that replica.
-    //
-    // Since there is a small probability of any given routing table ends up with many more segments to a single
-    // instance, we then filter out the routing tables based on a workload disparity metric (max number of segments
-    // assigned to a replica - min number of segments assigned to a replica).
-    //
-    // The algorithm is thus:
-    // 1. Compute the inverse external view, a mapping of servers to segments
-    // 2. For each server:
-    //   a) Pick (maxServersPerQuery - 1) additional distinct servers
-    //   b) Check if the server set covers all the segments; if not, add additional servers until it does.
-    //   c) Order the segments in our server set in ascending order of number of replicas present in our server set
-    //   d) For each segment, pick a random replica with proper weighting
-    //   e) Return that routing table
-    // 3. Filter the bottom 20% of the routing tables when ordered by the workload disparity metric
+    private void init(ExternalView externalView) {
+      random = new Random();
 
-    Random random = new Random();
-    long startTime = System.currentTimeMillis();
+      // Compute the inverse of the external view
+      for (String partition : externalView.getPartitionSet()) {
+        Set<String> instancesForSegment = new HashSet<>();
+        segmentToInstanceMap.put(partition, instancesForSegment);
 
-    // TODO jfim: Add instance pruning
+        for (Map.Entry<String, String> instanceAndState : externalView.getStateMap(partition).entrySet()) {
+          String instance = instanceAndState.getKey();
+          String state = instanceAndState.getValue();
 
-    // Compute the inverse of the external view
-    Map<String, Set<String>> segmentToInstanceMap = new HashMap<>();
-    Map<String, Set<String>> instanceToSegmentMap = new HashMap<>();
-    Set<String> segmentsWithAtLeastOneOnlineReplica = new HashSet<>();
-    for (String partition : externalView.getPartitionSet()) {
-      Set<String> instancesForSegment = new HashSet<>();
-      segmentToInstanceMap.put(partition, instancesForSegment);
+          // Only consider partitions that are ONLINE
+          if (!"ONLINE".equals(state)) {
+            continue;
+          }
 
-      for (Map.Entry<String, String> instanceAndState : externalView.getStateMap(partition).entrySet()) {
-        String instance = instanceAndState.getKey();
-        String state = instanceAndState.getValue();
+          // Add to the instance -> segments map
+          Set<String> partitionsForInstance = instanceToSegmentMap.get(instance);
 
-        // Only consider partitions that are ONLINE
-        if (!"ONLINE".equals(state)) {
-          continue;
+          if (partitionsForInstance ==  null) {
+            partitionsForInstance = new HashSet<>();
+            instanceToSegmentMap.put(instance, partitionsForInstance);
+          }
+
+          partitionsForInstance.add(partition);
+
+          // Add to the segment -> instances map
+          instancesForSegment.add(instance);
+
+          // Add to the valid segments map
+          segmentsWithAtLeastOneOnlineReplica.add(partition);
         }
-
-        // Add to the instance -> segments map
-        Set<String> partitionsForInstance = instanceToSegmentMap.get(instance);
-
-        if (partitionsForInstance ==  null) {
-          partitionsForInstance = new HashSet<>();
-          instanceToSegmentMap.put(instance, partitionsForInstance);
-        }
-
-        partitionsForInstance.add(partition);
-
-        // Add to the segment -> instances map
-        instancesForSegment.add(instance);
-
-        // Add to the valid segments map
-        segmentsWithAtLeastOneOnlineReplica.add(partition);
       }
+
+      allInstanceSet = instanceToSegmentMap.keySet();
+      instanceArray = allInstanceSet.toArray(new String[allInstanceSet.size()]);
+
+      segmentToInstanceArrayMap = new HashMap<>();
     }
 
-    Set<String> allInstanceSet = instanceToSegmentMap.keySet();
-    String[] instances = allInstanceSet.toArray(new String[allInstanceSet.size()]);
-
-    Map<String, String[]> segmentToInstanceArrayMap = new HashMap<>();
-
-    // Start building routing tables from seed servers, ordering them by ascending disparity
-    PriorityQueue<Pair<Map<String, Set<String>>, Integer>> routingTablesAndDisparityQueue =
-        new PriorityQueue<Pair<Map<String, Set<String>>, Integer>>(new Comparator<Pair<Map<String, Set<String>>, Integer>>() {
-      @Override
-      public int compare(Pair<Map<String, Set<String>>, Integer> left, Pair<Map<String, Set<String>>, Integer> right) {
-        return Integer.compare(left.getValue(), right.getValue());
-      }
-    });
-
-    for (Map.Entry<String, Set<String>> seedInstanceAndSegments : instanceToSegmentMap.entrySet()) {
-      String seedInstance = seedInstanceAndSegments.getKey();
-      Set<String> seedInstanceSegments = seedInstanceAndSegments.getValue();
-
+    private Map<String, Set<String>> generateRoutingTable() {
       // List of segments that have no instance serving them
       Set<String> segmentsNotHandledByServers = new HashSet<>(segmentsWithAtLeastOneOnlineReplica);
 
       // List of servers in this routing table
       Set<String> instancesInRoutingTable = new HashSet<>(maxServersPerQuery);
 
-      // Add seed instance
-      instancesInRoutingTable.add(seedInstance);
-      segmentsNotHandledByServers.removeAll(seedInstanceSegments);
-
       // If there are not enough instances, add them all
-      if (instances.length <= maxServersPerQuery) {
+      if (instanceArray.length <= maxServersPerQuery) {
         instancesInRoutingTable.addAll(allInstanceSet);
         segmentsNotHandledByServers.clear();
       } else {
-        // Otherwise add maxServersPerQuery - 1 instances
+        // Otherwise add maxServersPerQuery instances
         while (instancesInRoutingTable.size() < maxServersPerQuery) {
-          String randomInstance = instances[random.nextInt(instances.length)];
+          String randomInstance = instanceArray[random.nextInt(instanceArray.length)];
           instancesInRoutingTable.add(randomInstance);
           segmentsNotHandledByServers.removeAll(instanceToSegmentMap.get(randomInstance));
         }
@@ -242,49 +178,150 @@ public class LargeClusterRoutingTableBuilder extends AbstractRoutingTableBuilder
         }
       }
 
-      // Compute disparity metric
-      int maxSegmentCountPerServer = 0;
-      int minSegmentCountPerServer = Integer.MAX_VALUE;
-      for (Set<String> segmentsForServer : instanceToSegmentSetMap.values()) {
-        int serverSegmentCount = segmentsForServer.size();
+      return instanceToSegmentSetMap;
+    }
+  }
 
-        if (serverSegmentCount < minSegmentCountPerServer) {
-          minSegmentCountPerServer = serverSegmentCount;
-        }
+  @Override
+  public void init(Configuration configuration) {
+    // Nothing to do
+    // FIXME jfim: Read the max number of replicas to hit
+  }
 
-        if (maxSegmentCountPerServer < serverSegmentCount) {
-          maxSegmentCountPerServer = serverSegmentCount;
-        }
+  @Override
+  public List<ServerToSegmentSetMap> computeRoutingTableFromExternalView(String tableName, ExternalView externalView,
+      List<InstanceConfig> instanceConfigList) {
+    // The default routing table algorithm tries to balance all available segments across all servers, so that each
+    // server is hit on every query. This works fine with small clusters (say less than 20 servers) but for larger
+    // clusters, this adds up to significant overhead (one request must be enqueued for each server, processed,
+    // returned, deserialized, aggregated, etc.).
+    //
+    // For large clusters, we want to avoid hitting every server, as this also has an adverse effect on client tail
+    // latency. This is due to the fact that a query cannot return until it has received a response from each server,
+    // and the greater the number of servers that are hit, the more likely it is that one of the servers will be a
+    // straggler (eg. due to contention for query processing threads, GC, etc.). We also want to balance the segments
+    // within any given routing table so that each server in the routing table has approximately the same number of
+    // segments to process.
+    //
+    // This routing table algorithm builds n routing tables, where n is the number of servers in the cluster (we might
+    // want to revisit that assumption for clusters larger than, say, 250 servers). Each routing table has one 'seed'
+    // server with which the routing table is initialized. To this seed server, we add maxServersPerQuery - 1 randomly
+    // picked servers. This guarantees that each server will to appear in at least one routing table and that overall
+    // the number of routing tables will ensure an approximately even distribution of load (which would not be the case
+    // with a fixed number of routing tables, eg. 10 routing tables for a 100 node cluster with 50 replicas).
+    //
+    // With this list of servers, we check if the set of segments served by these servers is complete. If the set of
+    // segments served does not cover all of the segments, we compute the list of missing segments and pick a random
+    // server that serves these missing segments until we have complete coverage of all the segments.
+    //
+    // We then order the segments in ascending number of replicas within our server set, in order to allocate the
+    // segments with fewer replicas first. This ensures that segments that are 'easier' to allocate are more likely to
+    // end up on a replica with fewer segments.
+    //
+    // Then, we pick a random replica for each segment, iterating from fewest replicas to most replicas, inversely
+    // weighted by the number of segments already assigned to that replica.
+    //
+    // Since there is a small probability of any given routing table ends up with many more segments to a single
+    // instance, we then filter out the routing tables based on a workload disparity metric (max number of segments
+    // assigned to a replica - min number of segments assigned to a replica).
+    //
+    // The algorithm is thus:
+    // 1. Compute the inverse external view, a mapping of servers to segments
+    // 2. For each server:
+    //   a) Pick (maxServersPerQuery - 1) additional distinct servers
+    //   b) Check if the server set covers all the segments; if not, add additional servers until it does.
+    //   c) Order the segments in our server set in ascending order of number of replicas present in our server set
+    //   d) For each segment, pick a random replica with proper weighting
+    //   e) Return that routing table
+    // 3. Filter the bottom 20% of the routing tables when ordered by the workload disparity metric
+
+    long startTime = System.currentTimeMillis();
+
+    // TODO jfim: Add instance pruning
+
+    RoutingTableGenerator routingTableGenerator = new RoutingTableGenerator();
+    routingTableGenerator.init(externalView);
+
+    final int routingTableCount = 100;
+
+    PriorityQueue<Pair<Map<String, Set<String>>, Float>> topRoutingTables = new PriorityQueue<>(routingTableCount, new Comparator<Pair<Map<String, Set<String>>, Float>>() {
+      @Override
+      public int compare(Pair<Map<String, Set<String>>, Float> left, Pair<Map<String, Set<String>>, Float> right) {
+        // Float.compare sorts in ascending order and we want a max heap, so we need to return the negative of the comparison
+        return -Float.compare(left.getValue(), right.getValue());
       }
+    });
 
-      int disparity = maxSegmentCountPerServer - minSegmentCountPerServer;
-
-      // Add the routing table to the queue
-      routingTablesAndDisparityQueue.add(new ImmutablePair<>(instanceToSegmentSetMap, disparity));
+    for (int i = 0; i < routingTableCount; i++) {
+      topRoutingTables.add(generateRoutingTableWithMetric(routingTableGenerator));
     }
 
-    // Pick the top 80% of the routing tables with the smallest disparity (difference between max and min segment count
-    // per server)
-    List<ServerToSegmentSetMap> routingTables = new ArrayList<>(instanceToSegmentMap.size());
-    int routingTablePickCount = (int)(routingTablesAndDisparityQueue.size() * 0.8) + 1;
-    for (int i = 0; i < routingTablePickCount; i++) {
-      routingTables.add(new ServerToSegmentSetMap(routingTablesAndDisparityQueue.poll().getKey()));
+    // Generate routing more tables and keep the routingTableCount top ones
+    for(int i = 0; i < 900; ++i) {
+      Pair<Map<String, Set<String>>, Float> newRoutingTable = generateRoutingTableWithMetric(routingTableGenerator);
+      Pair<Map<String, Set<String>>, Float> worstRoutingTable = topRoutingTables.peek();
+
+      // If the new routing table is better than the worst one, keep it
+      if (newRoutingTable.getRight() < worstRoutingTable.getRight()) {
+        topRoutingTables.poll();
+        topRoutingTables.add(newRoutingTable);
+      }
+    }
+
+    // Return the best routing tables
+    List<ServerToSegmentSetMap> routingTables = new ArrayList<>(topRoutingTables.size());
+    while(!topRoutingTables.isEmpty()) {
+      Pair<Map<String, Set<String>>, Float> routingTableWithMetric = topRoutingTables.poll();
+      routingTables.add(new ServerToSegmentSetMap(routingTableWithMetric.getKey()));
     }
 
     long endTime = System.currentTimeMillis();
 
-    // TODO jfim: Remove this testing code
-    long totalTime = (endTime - startTime);
-    int routingTableCount = routingTables.size();
-    //System.out.println("totalTime = " + totalTime);
-    //System.out.println("routingTableCount = " + routingTableCount);
-
     return routingTables;
   }
 
+  private Pair<Map<String, Set<String>>, Float> generateRoutingTableWithMetric(RoutingTableGenerator routingTableGenerator) {
+    Map<String, Set<String>> routingTable = routingTableGenerator.generateRoutingTable();
+
+    float metric;
+
+    // TODO jfim: We could probably avoid this computation
+    int segmentCount = 0;
+    int serverCount = 0;
+    int maxSegmentCount = 0;
+    int minSegmentCount = Integer.MAX_VALUE;
+    for (Set<String> segmentsForServer : routingTable.values()) {
+      int segmentCountForServer = segmentsForServer.size();
+      segmentCount += segmentCountForServer;
+      segmentCount++;
+
+      if (maxSegmentCount < segmentCountForServer) {
+        maxSegmentCount = segmentCountForServer;
+      }
+
+      if (segmentCountForServer < minSegmentCount) {
+        minSegmentCount = segmentCountForServer;
+      }
+    }
+
+    float averageSegmentCount = ((float) segmentCount) / serverCount;
+    float variance = 0.0f;
+    for (Set<String> segmentsForServer : routingTable.values()) {
+      int segmentCountForServer = segmentsForServer.size();
+      float difference = segmentCountForServer - averageSegmentCount;
+      variance += difference * difference;
+    }
+
+    metric = variance;
+
+//    metric = maxSegmentCount - minSegmentCount;
+
+    return new ImmutablePair<>(routingTable, metric);
+  }
+
   public static void main(String[] args) throws Exception {
-    File[] coloDirs = new File("/Users/jfim/work/ev/dec-9").listFiles();
-    Stream<File> jsonFiles = Arrays.stream(coloDirs).flatMap(coloDir -> Arrays.stream(coloDir.listFiles()));
+    File[] coloDirs = new File("/home/jfim/work/ev/dec-9").listFiles();
+    Stream<File> jsonFiles = Arrays.stream(coloDirs).flatMap(coloDir -> Arrays.stream(coloDir.listFiles())).filter(file -> file.getName().equals("mirrorShareEvents") && file.getParentFile().getName().equals("prod-ltx1"));
     Stream<ExternalView> externalViews = jsonFiles.map(jsonFile -> {
       ExternalView externalView = new ExternalView(jsonFile.getParentFile().getName() + "_" + jsonFile.getName());
       try {
@@ -370,6 +407,7 @@ public class LargeClusterRoutingTableBuilder extends AbstractRoutingTableBuilder
       int subTableIndex = 0;
       if (!name.equals(previousName)) {
         currentRoutingTableCount = 0;
+        previousName = name;
       }
 
 
